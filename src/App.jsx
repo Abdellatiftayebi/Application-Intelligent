@@ -55,25 +55,125 @@ async function exportResultsToExcel(results, config) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// ─── LOCAL DB (localStorage-based) ──────────────────────────────────────────
+// ─── FIREBASE LOADER ─────────────────────────────────────────────────────────
+
+// ⚠️  IMPORTANT : Remplacez ces valeurs par celles de VOTRE projet Firebase
+// Créez un projet sur https://console.firebase.google.com
+// puis activez Firestore et copiez votre configuration ici.
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyA5oV5k4UFRHaN9eKQifZOxmwWE4g9XuiU",
+  authDomain:        "evaluationtp-15e65.firebaseapp.com",
+  projectId:         "evaluationtp-15e65",
+  storageBucket:     "evaluationtp-15e65.firebasestorage.app",
+  messagingSenderId: "241188479518",
+  appId:             "1:241188479518:web:28e811053e571b00ec840f",
+};
+
+let _db = null;
+let _firebaseReady = false;
+let _firebaseError = false;
+
+async function getFirestore() {
+  if (_db) return _db;
+  return new Promise((resolve) => {
+    if (window.__firebaseDB) { _db = window.__firebaseDB; resolve(_db); return; }
+    const loadScript = (src) => new Promise((res, rej) => {
+      const s = document.createElement("script"); s.src = src; s.type = "module";
+      s.onload = res; s.onerror = rej; document.head.appendChild(s);
+    });
+    // Use compat SDK for simpler global access
+    const s1 = document.createElement("script");
+    s1.src = "https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js";
+    s1.onload = () => {
+      const s2 = document.createElement("script");
+      s2.src = "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js";
+      s2.onload = () => {
+        try {
+          if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+          _db = firebase.firestore();
+          window.__firebaseDB = _db;
+          _firebaseReady = true;
+          resolve(_db);
+        } catch(e) { _firebaseError = true; resolve(null); }
+      };
+      s2.onerror = () => { _firebaseError = true; resolve(null); };
+      document.head.appendChild(s2);
+    };
+    s1.onerror = () => { _firebaseError = true; resolve(null); };
+    document.head.appendChild(s1);
+  });
+}
+
+// ─── LOCAL DB (localStorage pour config/questions, Firestore pour résultats) ──
 
 const DB = {
-  getResults: () => JSON.parse(localStorage.getItem("examResults") || "[]"),
-  saveResults: (arr) => localStorage.setItem("examResults", JSON.stringify(arr)),
-  addResult: (result) => {
-    const arr = DB.getResults();
-    arr.push(result);
-    DB.saveResults(arr);
+  // ── Résultats : Firestore (partagé) ──────────────────────────────────────
+  getResults: () => JSON.parse(localStorage.getItem("examResults_cache") || "[]"),
+
+  fetchResults: async () => {
+    const db = await getFirestore();
+    if (!db) return DB.getResults(); // fallback cache local
+    try {
+      const snap = await db.collection("examResults").orderBy("date", "asc").get();
+      const results = snap.docs.map(d => ({ _id: d.id, ...d.data() }));
+      localStorage.setItem("examResults_cache", JSON.stringify(results));
+      return results;
+    } catch(e) { return DB.getResults(); }
   },
-  getAttemptedApogees: () => {
-    const results = DB.getResults();
-    return new Set(results.map(r => r.student.apogee));
+
+  addResult: async (result) => {
+    const db = await getFirestore();
+    if (!db) {
+      // Fallback localStorage
+      const arr = DB.getResults(); arr.push(result);
+      localStorage.setItem("examResults_cache", JSON.stringify(arr));
+      return;
+    }
+    try {
+      await db.collection("examResults").add(result);
+      // Refresh cache
+      const arr = DB.getResults(); arr.push(result);
+      localStorage.setItem("examResults_cache", JSON.stringify(arr));
+    } catch(e) {
+      const arr = DB.getResults(); arr.push(result);
+      localStorage.setItem("examResults_cache", JSON.stringify(arr));
+    }
   },
-  hasAttempted: (apogee) => DB.getAttemptedApogees().has(String(apogee).trim()),
-  deleteResult: (apogee) => {
-    const arr = DB.getResults().filter(r => r.student.apogee !== apogee);
-    DB.saveResults(arr);
+
+  countAttempts: async (apogee) => {
+    const db = await getFirestore();
+    if (!db) return DB.getResults().filter(r => r.student.apogee === String(apogee).trim()).length;
+    try {
+      const snap = await db.collection("examResults")
+        .where("student.apogee", "==", String(apogee).trim()).get();
+      return snap.size;
+    } catch(e) {
+      return DB.getResults().filter(r => r.student.apogee === String(apogee).trim()).length;
+    }
   },
+
+  deleteResult: async (apogee) => {
+    const db = await getFirestore();
+    if (!db) {
+      const arr = DB.getResults().filter(r => r.student.apogee !== apogee);
+      localStorage.setItem("examResults_cache", JSON.stringify(arr));
+      return;
+    }
+    try {
+      const snap = await db.collection("examResults")
+        .where("student.apogee", "==", String(apogee).trim()).get();
+      const batch = db.batch();
+      snap.docs.forEach(d => batch.delete(d.ref));
+      await batch.commit();
+      const arr = DB.getResults().filter(r => r.student.apogee !== apogee);
+      localStorage.setItem("examResults_cache", JSON.stringify(arr));
+    } catch(e) {
+      const arr = DB.getResults().filter(r => r.student.apogee !== apogee);
+      localStorage.setItem("examResults_cache", JSON.stringify(arr));
+    }
+  },
+
+  // ── PDFs : localStorage (trop volumineux pour Firestore) ─────────────────
   getPDFs: () => JSON.parse(localStorage.getItem("examPDFs") || "{}"),
   savePDF: (apogee, pdfDataUrl) => {
     const pdfs = DB.getPDFs();
@@ -304,6 +404,7 @@ const DEFAULT_CONFIG = {
   passingScore: 50,
   showFeedback: true,
   tabSwitchWarnings: 3,
+  maxAttempts: 1,
 };
 
 const QUESTION_BANK = [
@@ -735,13 +836,13 @@ function LandingPage({ onStart, onAdmin }) {
     return Object.keys(e).length === 0;
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!validate()) return;
     setChecking(true);
-    // Check if apogee already attempted (frontend + "backend" via DB)
-    const alreadyAttempted = DB.hasAttempted(form.apogee.trim());
+    const attempts = await DB.countAttempts(form.apogee.trim());
+    const max = config.maxAttempts ?? 1;
     setChecking(false);
-    if (alreadyAttempted) {
+    if (attempts >= max) {
       setBlocked(true);
       return;
     }
@@ -841,7 +942,7 @@ function LandingPage({ onStart, onAdmin }) {
       <style>{CSS}</style>
       <div className="card slide-in" style={{ maxWidth: 440, width: "100%", padding: 40 }}>
         <button onClick={() => setStep("hero")} className="btn btn-secondary btn-sm" style={{ marginBottom: 24 }}>← Retour</button>
-        <div style={{ textAlign: "centre", marginBottom: 32 }}>
+        <div style={{ textAlign: "center", marginBottom: 32 }}>
           <div style={{ width: 56, height: 56, borderRadius: 14, background: "linear-gradient(135deg, #2563eb, #7c3aed)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px", fontSize: 24 }}>🎓</div>
           <h2 style={{ fontSize: 22, fontWeight: 700, color: "#1e293b", marginBottom: 6 }}>Identification</h2>
           <p style={{ fontSize: 14, color: "#64748b" }}>Veuillez compléter vos informations pour commencer</p>
@@ -852,7 +953,7 @@ function LandingPage({ onStart, onAdmin }) {
           { key: "prenom", label: "Prénom", placeholder: "Votre prénom", icon: "✏️" },
           { key: "apogee", label: "Code Apogée", placeholder: "Ex: 12345678", icon: "🔑" },
         ].map(({ key, label, placeholder, icon }) => (
-          <div key={key} style={{ textAlign: "left",marginBottom: 20 }}>
+          <div key={key} style={{textAlign: "left", marginBottom: 20 }}>
             <label>{icon} {label}</label>
             <input
               value={form[key]} placeholder={placeholder}
@@ -939,7 +1040,7 @@ function ExamInterface({ student, onFinish }) {
     return () => document.removeEventListener("visibilitychange", handle);
   }, [finished]);
 
-  const handleFinish = useCallback((auto = false) => {
+  const handleFinish = useCallback(async (auto = false) => {
     if (finished) return;
     setFinished(true);
     setShowConfirm(false);
@@ -951,7 +1052,7 @@ function ExamInterface({ student, onFinish }) {
       date: new Date().toISOString(),
       config,
     };
-    DB.addResult(result);
+    await DB.addResult(result);
     localStorage.removeItem("examProgress");
     onFinish(result);
   }, [finished, answers, questions, timeLeft]);
@@ -1159,7 +1260,7 @@ function AdminLogin({ onLogin, onBack }) {
         <input value={form.username} onChange={e => setForm(f => ({ ...f, username: e.target.value }))} placeholder="admin" style={{ marginBottom: 16 }} />
         <label style={{textAlign: "left"}}>Mot de passe</label>
         <input type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} placeholder="••••••••" onKeyDown={e => e.key === "Enter" && handle()} style={{ marginBottom: error ? 8 : 20 }} />
-        {error && <p style={{color: "#ef4444", fontSize: 13, marginBottom: 16 }}>⚠ {error}</p>}
+        {error && <p style={{ color: "#ef4444", fontSize: 13, marginBottom: 16 }}>⚠ {error}</p>}
         <button onClick={handle} className="btn btn-primary" style={{ width: "100%", justifyContent: "center" }}>Se connecter</button>
         <button onClick={onBack} className="btn btn-secondary" style={{ width: "100%", justifyContent: "center", marginTop: 10 }}>← Retour</button>
         <p style={{ fontSize: 12, color: "#94a3b8", textAlign: "center", marginTop: 16 }}></p>
@@ -1175,11 +1276,17 @@ function AdminDashboard({ onLogout }) {
   const [config, setConfig] = useState(() => JSON.parse(localStorage.getItem("examConfig") || JSON.stringify(DEFAULT_CONFIG)));
   const [questions, setQuestions] = useState(() => JSON.parse(localStorage.getItem("examQuestions") || JSON.stringify(QUESTION_BANK)));
   const [results, setResults] = useState(() => DB.getResults());
+  const [loadingResults, setLoadingResults] = useState(true);
   const [notification, setNotification] = useState(null);
   const [editingQ, setEditingQ] = useState(null);
   const [showQModal, setShowQModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [selectedResult, setSelectedResult] = useState(null);
+
+  // Fetch results from Firestore on mount
+  useEffect(() => {
+    DB.fetchResults().then(r => { setResults(r); setLoadingResults(false); });
+  }, []);
 
   const notify = (message, type = "success") => {
     setNotification({ message, type });
@@ -1215,11 +1322,12 @@ function AdminDashboard({ onLogout }) {
     setEditingQ(null);
   };
 
-  const deleteStudent = (apogee) => {
+  const deleteStudent = async (apogee) => {
     if (!confirm(`Supprimer l'étudiant avec le code Apogée ${apogee} ? Cette action est irréversible.`)) return;
-    DB.deleteResult(apogee);
+    await DB.deleteResult(apogee);
     DB.deletePDF(apogee);
-    setResults(DB.getResults());
+    const updated = await DB.fetchResults();
+    setResults(updated);
     if (selectedResult?.student?.apogee === apogee) setSelectedResult(null);
     notify(`Étudiant ${apogee} supprimé`, "info");
   };
@@ -1285,6 +1393,11 @@ function AdminDashboard({ onLogout }) {
         {tab === "dashboard" && (
           <div className="fade-in">
             <h2 style={{ fontSize: 22, fontWeight: 800, marginBottom: 24 }}>Tableau de bord</h2>
+            {loadingResults && (
+              <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 10, padding: "12px 18px", marginBottom: 20, fontSize: 14, color: "#1d4ed8" }}>
+                ⏳ Chargement des résultats depuis le serveur...
+              </div>
+            )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 16, marginBottom: 28 }}>
               {[
                 { icon: "👥", label: "Étudiants", val: results.length, color: "#2563eb" },
@@ -1441,6 +1554,7 @@ function AdminDashboard({ onLogout }) {
                   { key: "scorePerQuestion", label: "Points par question", type: "number" },
                   { key: "passingScore", label: "Seuil de réussite (%)", type: "number" },
                   { key: "tabSwitchWarnings", label: "Avertissements onglet", type: "number" },
+                  { key: "maxAttempts", label: "Nombre de tentatives autorisées", type: "number" },
                 ].map(({ key, label, type }) => (
                   <div key={key} style={{ marginBottom: 16 }}>
                     <label>{label}</label>
